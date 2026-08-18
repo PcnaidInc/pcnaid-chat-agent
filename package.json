@@ -21,8 +21,8 @@
   "license": "MIT",
   "devDependencies": {
     "@biomejs/biome": "^2.3.2",
-    "@cloudflare/vite-plugin": "1.13.18",
-    "@cloudflare/vitest-pool-workers": "^0.10.3",
+    "@cloudflare/vite-plugin": "1.52.1",
+    "@cloudflare/vitest-pool-workers": "^0.21.3",
     "@cloudflare/workers-types": "^4.20251014.0",
     "@tailwindcss/vite": "^4.1.16",
     "@types/node": "^24.9.2",
@@ -34,7 +34,7 @@
     "typescript": "^5.9.3",
     "vite": "^7.1.12",
     "vitest": "3.2.4",
-    "wrangler": "^4.45.3"
+    "wrangler": "^4.123.0"
   },
   "dependencies": {
     "@ai-sdk/openai": "^2.0.59",
