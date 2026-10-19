@@ -233,6 +233,16 @@ Each use case can be implemented by:
 - [Cloudflare Agents Documentation](https://developers.cloudflare.com/agents/)
 - [Cloudflare Workers Documentation](https://developers.cloudflare.com/workers/)
 
+## CI
+
+Continuous integration runs via the GitHub Actions workflow in `.github/workflows/ci.yml` on pull requests and pushes to `main`. It runs the following commands:
+
+- `npx tsc --noEmit`
+- `npx biome lint`
+- `npx prettier . --check`
+- `npx vitest run`
+- `npx vite build`
+
 ## License
 
 MIT
