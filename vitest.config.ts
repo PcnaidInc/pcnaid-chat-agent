@@ -17,7 +17,8 @@ export default defineWorkersConfig({
     },
     poolOptions: {
       workers: {
-        wrangler: { configPath: "./wrangler.jsonc" }
+        wrangler: { configPath: "./wrangler.jsonc" },
+        remoteBindings: false
       }
     }
   }
