@@ -1,0 +1,73 @@
+name: Dependabot auto-merge
+
+# Merges a Dependabot PR only after this repo's own CI workflow succeeded on that exact head SHA, and
+# closes a failing MAJOR bump (Dependabot treats a closed PR as "ignore this version"). The trigger is
+# workflow_run, not pull_request + `gh pr merge --auto`: with no required status checks configured,
+# --auto merges immediately and the merge would have no gate at all. Update types come from the
+# metadata block Dependabot writes into its commit message, so no third-party action is used.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: dependabot-auto-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  decide:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.actor.login == 'dependabot[bot]' &&
+      (github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+      WF_PATH: ${{ github.event.workflow_run.path }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Merge a green patch/minor bump, close a failing major bump
+        run: |
+          set -euo pipefail
+          [ -n "$PR_NUMBER" ] || { echo "workflow run has no pull request; nothing to do"; exit 0; }
+
+          pr=$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER")
+          [ "$(jq -r .state <<<"$pr")" = open ] || { echo "PR #$PR_NUMBER is not open"; exit 0; }
+          [ "$(jq -r .head.sha <<<"$pr")" = "$HEAD_SHA" ] || { echo "PR #$PR_NUMBER head moved past the CI run; a newer run will decide"; exit 0; }
+          [ "$(jq -r .user.login <<<"$pr")" = "dependabot[bot]" ] || { echo "PR #$PR_NUMBER is not authored by Dependabot"; exit 0; }
+
+          types=$(gh api --paginate "repos/$GH_REPO/pulls/$PR_NUMBER/commits" --jq '.[].commit.message' \
+            | grep -oE 'update-type: version-update:semver-(major|minor|patch)' | sort -u || true)
+          [ -n "$types" ] || { echo "no update-type metadata in the commit message; leaving PR #$PR_NUMBER to a human"; exit 0; }
+          echo "update types: $(tr '\n' ' ' <<<"$types")"
+
+          if grep -q 'semver-major' <<<"$types"; then
+            [ "$CONCLUSION" = failure ] || { echo "major bump with green CI is left to a human"; exit 0; }
+            wf=$(basename "${WF_PATH%%@*}")
+            main=$(gh api "repos/$GH_REPO/actions/workflows/$wf/runs?branch=$DEFAULT_BRANCH&status=completed&per_page=1" --jq '.workflow_runs[0].conclusion // "none"')
+            [ "$main" = success ] || { echo "CI on $DEFAULT_BRANCH is '$main', so this failure may not be the bump's; not closing"; exit 0; }
+            gh pr close "$PR_NUMBER" --comment "Closing: this major bump fails this repository's CI on its own head ($HEAD_SHA) while CI on $DEFAULT_BRANCH is green. A major version is a breaking change that needs a human-written migration; Dependabot treats a closed PR as ignoring this version."
+            echo "closed PR #$PR_NUMBER"
+            exit 0
+          fi
+
+          [ "$CONCLUSION" = success ] || { echo "CI failed on a patch/minor bump; leaving PR #$PR_NUMBER open"; exit 0; }
+          bad=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.conclusion=="failure" or .conclusion=="timed_out" or .conclusion=="cancelled") | select(.name | startswith("Workers Builds") | not) | .name] | join(", ")')
+          [ -z "$bad" ] || { echo "other checks failed on the head ($bad); not merging"; exit 0; }
+          if gh pr merge "$PR_NUMBER" --squash --match-head-commit "$HEAD_SHA"; then
+            echo "merged PR #$PR_NUMBER"
+          else
+            echo "::warning::could not merge PR #$PR_NUMBER (conflict or branch protection); leaving it open"
+          fi
