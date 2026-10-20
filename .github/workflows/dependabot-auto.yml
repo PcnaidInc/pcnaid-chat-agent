@@ -30,6 +30,7 @@ jobs:
       pull-requests: write
       actions: read
       checks: read
+      statuses: read
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -74,6 +75,11 @@ jobs:
           bad=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA/check-runs?per_page=100" --paginate \
             --jq '.check_runs[] | select(.name | startswith("Workers Builds") | not) | select(.status != "completed" or ((.conclusion // "") | IN("success", "neutral", "skipped") | not)) | "\(.name) (\(.status)/\(.conclusion // "none"))"' \
             | paste -sd, -)
+          # Legacy commit statuses (external integrations that do not publish check runs) are a separate API.
+          bad_status=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA/status" \
+            --jq '.statuses[] | select(.context | startswith("Workers Builds") | not) | select(.state != "success") | "\(.context) (\(.state))"' \
+            | paste -sd, -)
+          bad="${bad:+$bad,}$bad_status"
           [ -z "$bad" ] || { echo "checks still pending or not successful on the head ($bad); not merging"; exit 0; }
           if gh pr merge "$PR_NUMBER" --squash --match-head-commit "$HEAD_SHA"; then
             echo "merged PR #$PR_NUMBER"
