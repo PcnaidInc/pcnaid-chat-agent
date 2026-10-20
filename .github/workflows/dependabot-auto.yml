@@ -24,7 +24,7 @@ jobs:
       github.event.workflow_run.actor.login == 'dependabot[bot]' &&
       (github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure')
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 30
     permissions:
       contents: write
       pull-requests: write
@@ -55,6 +55,9 @@ jobs:
           [ -n "$types" ] || { echo "no update-type metadata in the commit message; leaving PR #$PR_NUMBER to a human"; exit 0; }
           echo "update types: $(tr '\n' ' ' <<<"$types")"
 
+          # Every wait below polls (30 s steps, 40 tries) because this job is triggered once, by the CI workflow
+          # finishing: a check or a default-branch run that is still pending at that moment would otherwise never
+          # be looked at again.
           if grep -q 'semver-major' <<<"$types"; then
             [ "$CONCLUSION" = failure ] || { echo "major bump with green CI is left to a human"; exit 0; }
             # A security update can be a major bump (dependabot.yml only ignores ordinary majors), and closing it
@@ -64,7 +67,12 @@ jobs:
             fi
             wf=$(basename "${WF_PATH%%@*}")
             main_sha=$(gh api "repos/$GH_REPO/commits/$DEFAULT_BRANCH" --jq .sha)
-            main=$(gh api "repos/$GH_REPO/actions/workflows/$wf/runs?branch=$DEFAULT_BRANCH&head_sha=$main_sha&per_page=1" --jq '.workflow_runs[0].conclusion // "none"')
+            main=none
+            for _ in $(seq 1 40); do
+              main=$(gh api "repos/$GH_REPO/actions/workflows/$wf/runs?branch=$DEFAULT_BRANCH&head_sha=$main_sha&per_page=1" \
+                --jq '.workflow_runs[0] | if . == null then "none" elif .status != "completed" then "pending" else .conclusion end')
+              case "$main" in pending|none) sleep 30 ;; *) break ;; esac
+            done
             [ "$main" = success ] || { echo "CI on $DEFAULT_BRANCH at $main_sha is '$main', so this failure may not be the bump's; not closing"; exit 0; }
             gh pr close "$PR_NUMBER" --comment "Closing: this major bump fails this repository's CI on its own head ($HEAD_SHA) while CI on $DEFAULT_BRANCH ($main_sha) is green. A major version is a breaking change that needs a human-written migration; Dependabot treats a closed PR as ignoring this version."
             echo "closed PR #$PR_NUMBER"
@@ -72,14 +80,32 @@ jobs:
           fi
 
           [ "$CONCLUSION" = success ] || { echo "CI failed on a patch/minor bump; leaving PR #$PR_NUMBER open"; exit 0; }
-          bad=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA/check-runs?per_page=100" --paginate \
-            --jq '.check_runs[] | select(.name | startswith("Workers Builds") | not) | select(.status != "completed" or ((.conclusion // "") | IN("success", "neutral", "skipped") | not)) | "\(.name) (\(.status)/\(.conclusion // "none"))"' \
-            | paste -sd, -)
-          # Legacy commit statuses (external integrations that do not publish check runs) are a separate API.
-          bad_status=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA/status" \
-            --jq '.statuses[] | select(.context | startswith("Workers Builds") | not) | select(.state != "success") | "\(.context) (\(.state))"' \
-            | paste -sd, -)
-          bad="${bad:+$bad,}$bad_status"
+
+          # The head must contain the current default-branch tip: another bump may have merged while this one was
+          # tested, and --match-head-commit only pins the PR head. A stale branch is updated, which re-runs CI.
+          behind=$(gh api "repos/$GH_REPO/compare/$HEAD_SHA...$DEFAULT_BRANCH" --jq .ahead_by)
+          if [ "$behind" != 0 ]; then
+            gh api -X PUT "repos/$GH_REPO/pulls/$PR_NUMBER/update-branch" -f expected_head_sha="$HEAD_SHA" >/dev/null \
+              && echo "PR #$PR_NUMBER was $behind commit(s) behind $DEFAULT_BRANCH; updated the branch, the new CI run decides" \
+              || echo "::warning::PR #$PR_NUMBER is behind $DEFAULT_BRANCH and could not be updated; leaving it open"
+            exit 0
+          fi
+
+          bad=""
+          for _ in $(seq 1 40); do
+            bad=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA/check-runs?per_page=100" --paginate \
+              --jq '.check_runs[] | select(.name | startswith("Workers Builds") | not) | select(.status != "completed" or ((.conclusion // "") | IN("success", "neutral", "skipped") | not)) | "\(.name) (\(.status)/\(.conclusion // "none"))"' \
+              | paste -sd, -)
+            # Legacy commit statuses (external integrations that do not publish check runs) are a separate API.
+            bad_status=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA/status?per_page=100" --paginate \
+              --jq '.statuses[] | select(.context | startswith("Workers Builds") | not) | select(.state != "success") | "\(.context) (\(.state))"' \
+              | paste -sd, -)
+            bad="${bad:+$bad,}$bad_status"
+            # Only a pending check is worth waiting for; a finished failure is final.
+            if [ -n "$bad" ] && ! grep -qE 'queued|in_progress|waiting|pending|requested' <<<"$bad"; then break; fi
+            [ -z "$bad" ] && break
+            sleep 30
+          done
           [ -z "$bad" ] || { echo "checks still pending or not successful on the head ($bad); not merging"; exit 0; }
           if gh pr merge "$PR_NUMBER" --squash --match-head-commit "$HEAD_SHA"; then
             echo "merged PR #$PR_NUMBER"
