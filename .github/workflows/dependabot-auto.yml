@@ -71,9 +71,10 @@ jobs:
           fi
 
           [ "$CONCLUSION" = success ] || { echo "CI failed on a patch/minor bump; leaving PR #$PR_NUMBER open"; exit 0; }
-          bad=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
-            --jq '[.check_runs[] | select(.conclusion=="failure" or .conclusion=="timed_out" or .conclusion=="cancelled") | select(.name | startswith("Workers Builds") | not) | .name] | join(", ")')
-          [ -z "$bad" ] || { echo "other checks failed on the head ($bad); not merging"; exit 0; }
+          bad=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA/check-runs?per_page=100" --paginate \
+            --jq '.check_runs[] | select(.name | startswith("Workers Builds") | not) | select(.status != "completed" or ((.conclusion // "") | IN("success", "neutral", "skipped") | not)) | "\(.name) (\(.status)/\(.conclusion // "none"))"' \
+            | paste -sd, -)
+          [ -z "$bad" ] || { echo "checks still pending or not successful on the head ($bad); not merging"; exit 0; }
           if gh pr merge "$PR_NUMBER" --squash --match-head-commit "$HEAD_SHA"; then
             echo "merged PR #$PR_NUMBER"
           else
