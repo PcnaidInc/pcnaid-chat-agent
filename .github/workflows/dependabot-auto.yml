@@ -14,7 +14,10 @@ on:
 permissions: {}
 
 concurrency:
-  group: dependabot-auto-${{ github.event.workflow_run.head_branch }}
+  # One decision at a time per repository: the behind-check and the merge below run under this lock.
+  # GitHub keeps only one pending run per group, so a decision dropped here is recovered by the
+  # post-merge step, which updates every other open Dependabot branch that is now behind.
+  group: dependabot-auto
   cancel-in-progress: false
 
 jobs:
@@ -33,6 +36,7 @@ jobs:
       statuses: read
     env:
       GH_TOKEN: ${{ github.token }}
+      HAS_APP: ${{ secrets.DEPENDABOT_AUTO_APP_ID != '' && secrets.DEPENDABOT_AUTO_APP_KEY != '' }}
       GH_REPO: ${{ github.repository }}
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
       CONCLUSION: ${{ github.event.workflow_run.conclusion }}
@@ -40,7 +44,25 @@ jobs:
       WF_PATH: ${{ github.event.workflow_run.path }}
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
+      # With an App installed on the repo, merges and branch updates are made by the App: GITHUB_TOKEN
+      # events do not start push or pull_request workflows, so a GITHUB_TOKEN merge would skip deploys
+      # and a GITHUB_TOKEN branch update would never re-run CI.
+      - name: Mint a repository-scoped App token
+        id: app
+        if: env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.DEPENDABOT_AUTO_APP_ID }}
+          private-key: ${{ secrets.DEPENDABOT_AUTO_APP_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-actions: read
+          permission-checks: read
+          permission-statuses: read
       - name: Merge a green patch/minor bump, close a failing major bump
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
         run: |
           set -euo pipefail
           [ -n "$PR_NUMBER" ] || { echo "workflow run has no pull request; nothing to do"; exit 0; }
@@ -109,6 +131,15 @@ jobs:
           [ -z "$bad" ] || { echo "checks still pending or not successful on the head ($bad); not merging"; exit 0; }
           if gh pr merge "$PR_NUMBER" --squash --match-head-commit "$HEAD_SHA"; then
             echo "merged PR #$PR_NUMBER"
+            # The merge moved the default branch: every other open Dependabot branch is now behind. Update them so
+            # their CI re-runs and decides on the new base (needs the App token; GITHUB_TOKEN updates start no CI).
+            if [ "$HAS_APP" = true ]; then
+              for other in $(gh api "repos/$GH_REPO/pulls?state=open&per_page=100" --paginate --jq '.[] | select(.user.login == "dependabot[bot]") | .number'); do
+                [ "$other" != "$PR_NUMBER" ] || continue
+                gh api -X PUT "repos/$GH_REPO/pulls/$other/update-branch" >/dev/null 2>&1 \
+                  && echo "updated PR #$other onto the new $DEFAULT_BRANCH tip; its CI run decides" || true
+              done
+            fi
           else
             echo "::warning::could not merge PR #$PR_NUMBER (conflict or branch protection); leaving it open"
           fi
